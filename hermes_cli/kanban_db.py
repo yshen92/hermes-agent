@@ -3270,6 +3270,20 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                # A task explicitly created in ``blocked`` is an operator hold.
+                # Emit the same lifecycle signal as ``block_task`` so
+                # ``recompute_ready`` cannot silently dispatch it before an
+                # explicit ``unblock_task``.
+                if initial_status == "blocked":
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "initial-status: created-blocked",
+                            "source": "create_task",
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:

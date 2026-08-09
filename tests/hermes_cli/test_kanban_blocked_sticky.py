@@ -76,6 +76,30 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             assert kb.get_task(conn, tid).status == "blocked"
 
 
+def test_initially_blocked_task_is_sticky_until_explicit_unblock(
+    kanban_home: Path,
+) -> None:
+    """A creation-time operator hold must never enter dispatcher readiness."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="operator parked gate",
+            initial_status="blocked",
+        )
+        assert [row["kind"] for row in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (tid,)
+        )] == ["created", "blocked"]
+        assert kb.recompute_ready(conn) == 0
+        blocked = kb.get_task(conn, tid)
+        assert blocked is not None
+        assert blocked.status == "blocked"
+
+        assert kb.unblock_task(conn, tid)
+        unblocked = kb.get_task(conn, tid)
+        assert unblocked is not None
+        assert unblocked.status == "ready"
+
+
 
 
 # ---------------------------------------------------------------------------
