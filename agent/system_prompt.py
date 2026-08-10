@@ -35,6 +35,7 @@ from agent.prompt_builder import (
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
+    RESTRICTED_KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
@@ -53,6 +54,18 @@ from hermes_constants import get_hermes_home
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+
+def _is_restricted_kanban_worker() -> bool:
+    """Use the lifecycle parser so false-like env values stay non-restricted."""
+    try:
+        from hermes_cli.kanban_lifecycle import is_restricted_worker
+
+        return is_restricted_worker()
+    except ImportError:
+        # Fail closed if the lifecycle module is unavailable in a partial
+        # installation, matching the DB/tool-layer import fallbacks.
+        return bool(os.environ.get("HERMES_KANBAN_RESTRICTED_WORKER"))
 
 
 def _ra():
@@ -241,6 +254,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
         # Fallback for code paths that bypass agent_init (rare).
         tool_guidance.append(KANBAN_GUIDANCE)
+    elif (
+        _kanban_guidance is None
+        and _is_restricted_kanban_worker()
+        and "kanban_complete" in agent.valid_tool_names
+    ):
+        context = os.environ.get("HERMES_KANBAN_CONTEXT", "").strip()
+        tool_guidance.append(
+            RESTRICTED_KANBAN_GUIDANCE
+            + (f"\n## Trusted task context snapshot\n{context}\n" if context else "")
+        )
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
 

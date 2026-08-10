@@ -179,9 +179,16 @@ def _assert_not_delegated_child_mutation() -> None:
         delegated = is_delegated_child_process_context()
     except Exception:
         delegated = bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
-    if delegated:
+    try:
+        from hermes_cli.kanban_lifecycle import is_restricted_worker
+
+        restricted = is_restricted_worker()
+    except Exception:
+        restricted = bool(os.environ.get("HERMES_KANBAN_RESTRICTED_WORKER"))
+    if delegated or restricted:
+        subject = "restricted Kanban workers" if restricted else "delegate_task child contexts"
         raise PermissionError(
-            "delegate_task child contexts cannot mutate Kanban tasks or boards"
+            f"{subject} cannot mutate Kanban tasks or boards directly"
         )
 
 
@@ -2169,6 +2176,23 @@ def connect(
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
     """
+    # Restricted native workers receive their task context at spawn and return
+    # lifecycle through the parent control socket. Refuse even connection
+    # setup here: connect() performs mkdir/WAL/schema work before any public
+    # mutator reaches write_txn(). The fixed OS identity remains the decisive
+    # raw-SQLite boundary if a worker removes this marker.
+    try:
+        from hermes_cli.kanban_lifecycle import is_restricted_worker
+
+        if is_restricted_worker():
+            raise PermissionError(
+                "restricted Kanban workers cannot open the board database"
+            )
+    except ImportError:
+        if os.environ.get("HERMES_KANBAN_RESTRICTED_WORKER"):
+            raise PermissionError(
+                "restricted Kanban workers cannot open the board database"
+            )
     if db_path is not None:
         path = db_path
     else:
@@ -4856,6 +4880,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    expected_binding: Optional[RestrictedWorkerBinding] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4886,6 +4911,15 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    if expected_binding is not None:
+        if expected_binding.task_id != task_id:
+            return False
+        if (
+            expected_run_id is not None
+            and int(expected_run_id) != expected_binding.run_id
+        ):
+            return False
+        expected_run_id = expected_binding.run_id
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4935,7 +4969,7 @@ def complete_task(
                 """,
                 (result, now, task_id),
             )
-        else:
+        elif expected_binding is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4952,6 +4986,48 @@ def complete_task(
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'done',
+                       result       = ?,
+                       completed_at = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL,
+                       block_kind   = NULL,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status = 'running'
+                   AND current_run_id = ?
+                   AND assignee = ?
+                   AND workspace_path = ?
+                   AND claim_lock = ?
+                   AND claim_expires IS NOT NULL
+                   AND claim_expires >= CAST(strftime('%s','now') AS INTEGER)
+                   AND worker_pid = ?
+                   AND EXISTS (
+                       SELECT 1 FROM task_runs r
+                        WHERE r.id = tasks.current_run_id
+                          AND r.task_id = tasks.id
+                          AND r.profile = ?
+                          AND r.status = 'running'
+                          AND r.ended_at IS NULL
+                          AND r.claim_lock = ?
+                          AND r.claim_expires IS NOT NULL
+                          AND r.claim_expires >= CAST(strftime('%s','now') AS INTEGER)
+                          AND r.worker_pid = ?
+                   )
+                """,
+                (
+                    result, now, task_id, expected_binding.run_id,
+                    expected_binding.profile, expected_binding.workspace_path,
+                    expected_binding.claim_lock, expected_binding.pid,
+                    expected_binding.profile, expected_binding.claim_lock,
+                    expected_binding.pid,
+                ),
             )
         if cur.rowcount != 1:
             return False
@@ -5636,6 +5712,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    expected_binding: Optional[RestrictedWorkerBinding] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -5668,6 +5745,44 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    if expected_binding is not None:
+        if expected_binding.task_id != task_id:
+            return False
+        if (
+            expected_run_id is not None
+            and int(expected_run_id) != expected_binding.run_id
+        ):
+            return False
+        expected_run_id = expected_binding.run_id
+    binding_clause = ""
+    binding_params: tuple[Any, ...] = ()
+    if expected_binding is not None:
+        binding_clause = """
+                   AND assignee = ?
+                   AND workspace_path = ?
+                   AND claim_lock = ?
+                   AND claim_expires IS NOT NULL
+                   AND claim_expires >= CAST(strftime('%s','now') AS INTEGER)
+                   AND worker_pid = ?
+                   AND EXISTS (
+                       SELECT 1 FROM task_runs r
+                        WHERE r.id = tasks.current_run_id
+                          AND r.task_id = tasks.id
+                          AND r.profile = ?
+                          AND r.status = 'running'
+                          AND r.ended_at IS NULL
+                          AND r.claim_lock = ?
+                          AND r.claim_expires IS NOT NULL
+                          AND r.claim_expires >= CAST(strftime('%s','now') AS INTEGER)
+                          AND r.worker_pid = ?
+                   )
+        """
+        binding_params = (
+            expected_binding.profile, expected_binding.workspace_path,
+            expected_binding.claim_lock, expected_binding.pid,
+            expected_binding.profile, expected_binding.claim_lock,
+            expected_binding.pid,
+        )
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -5699,9 +5814,10 @@ def block_task(
                        block_kind    = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                """ + ("" if expected_run_id is None else " AND current_run_id = ?")
+                + binding_clause,
                 (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                else (kind, task_id, int(expected_run_id)) + binding_params,
             )
             if cur.rowcount != 1:
                 return False
@@ -5752,9 +5868,10 @@ def block_task(
                        block_recurrences = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                """ + ("" if expected_run_id is None else " AND current_run_id = ?")
+                + binding_clause,
                 (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                else (kind, recurrences, task_id, int(expected_run_id)) + binding_params,
             )
             if cur.rowcount != 1:
                 return False
@@ -5778,37 +5895,22 @@ def block_task(
                 run_id=run_id,
             )
         else:
-            if expected_run_id is None:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?
-                     WHERE id = ?
-                       AND status IN ('running', 'ready')
-                    """,
-                    (kind, recurrences, task_id),
-                )
-            else:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?
-                     WHERE id = ?
-                       AND status IN ('running', 'ready')
-                       AND current_run_id = ?
-                    """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
-                )
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'blocked',
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL,
+                       block_kind    = ?,
+                       block_recurrences = ?
+                 WHERE id = ?
+                   AND status IN ('running', 'ready')
+                """ + ("" if expected_run_id is None else " AND current_run_id = ?")
+                + binding_clause,
+                (kind, recurrences, task_id) if expected_run_id is None
+                else (kind, recurrences, task_id, int(expected_run_id)) + binding_params,
+            )
             if cur.rowcount != 1:
                 return False
             run_id = _end_run(
@@ -6875,6 +6977,327 @@ _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
 
+@dataclass(frozen=True)
+class RestrictedWorkerBinding:
+    """Dispatcher-owned identity for one restricted child result stream."""
+
+    pid: int
+    task_id: str
+    run_id: int
+    profile: str
+    workspace_path: str
+    workspace: str
+    board_db_path: str
+    claim_lock: str
+    expected_uid: int
+    channel: Any
+
+
+_restricted_worker_bindings: "dict[int, RestrictedWorkerBinding]" = {}
+
+
+def _register_restricted_worker(
+    *,
+    pid: int,
+    task: Task,
+    workspace: str,
+    board_db_path: str,
+    expected_uid: int,
+    channel: Any,
+) -> None:
+    """Bind a child stream to dispatcher state captured at spawn time."""
+    if (
+        task.current_run_id is None
+        or not task.assignee
+        or not task.claim_lock
+    ):
+        raise RuntimeError("restricted worker requires an active claimed run")
+    _restricted_worker_bindings[int(pid)] = RestrictedWorkerBinding(
+        pid=int(pid),
+        task_id=task.id,
+        run_id=int(task.current_run_id),
+        profile=task.assignee,
+        workspace_path=workspace,
+        workspace=os.path.realpath(workspace),
+        board_db_path=os.path.realpath(board_db_path),
+        claim_lock=task.claim_lock,
+        expected_uid=int(expected_uid),
+        channel=channel,
+    )
+
+
+def _read_restricted_worker_result(
+    binding: RestrictedWorkerBinding,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Receive one PID/UID-authenticated datagram from this child."""
+    import socket
+    import struct
+
+    from hermes_cli.kanban_lifecycle import MAX_RESULT_BYTES, parse_result
+
+    channel = binding.channel
+    try:
+        data, ancillary, flags, _address = channel.recvmsg(
+            MAX_RESULT_BYTES + 1,
+            socket.CMSG_SPACE(struct.calcsize("3i")),
+        )
+    except OSError as exc:
+        return None, f"lifecycle channel unavailable: {type(exc).__name__}"
+    if flags & getattr(socket, "MSG_TRUNC", 0) or len(data) > MAX_RESULT_BYTES:
+        return None, "lifecycle result exceeds size limit"
+    credentials = None
+    for level, kind, value in ancillary:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_CREDENTIALS:
+            credentials = struct.unpack("3i", value[: struct.calcsize("3i")])
+            break
+    if credentials is None:
+        return None, "lifecycle sender credentials are missing"
+    sender_pid, sender_uid, _sender_gid = credentials
+    if sender_pid != binding.pid or sender_uid != binding.expected_uid:
+        return None, "lifecycle sender PID/UID does not match spawn binding"
+    try:
+        channel.recv(1)
+    except BlockingIOError:
+        pass
+    except OSError:
+        pass
+    else:
+        return None, "multiple lifecycle results"
+    return parse_result(data)
+
+
+def _validate_restricted_binding(
+    conn: sqlite3.Connection,
+    binding: RestrictedWorkerBinding,
+) -> tuple[Optional[Task], Optional[str]]:
+    """Bind a result to current dispatcher-owned task and run state."""
+    now = int(time.time())
+    task = get_task(conn, binding.task_id)
+    if task is None:
+        return None, "task no longer exists"
+    if task.status != "running":
+        return None, "task is not running"
+    if task.current_run_id != binding.run_id:
+        return None, "run is stale or foreign"
+    if task.assignee != binding.profile:
+        return None, "assignee/profile changed"
+    if not task.workspace_path or os.path.realpath(task.workspace_path) != binding.workspace:
+        return None, "workspace changed"
+    if task.workspace_path != binding.workspace_path:
+        return None, "workspace spelling changed"
+    if task.claim_lock != binding.claim_lock:
+        return None, "claim ownership changed"
+    if task.claim_expires is None or int(task.claim_expires) < now:
+        return None, "claim expired"
+    if task.worker_pid != binding.pid:
+        return None, "worker PID changed"
+    run = conn.execute(
+        "SELECT task_id, profile, status, ended_at, claim_lock, claim_expires, worker_pid "
+        "FROM task_runs WHERE id = ?",
+        (binding.run_id,),
+    ).fetchone()
+    if run is None:
+        return None, "run no longer exists"
+    if (
+        run["task_id"] != binding.task_id
+        or run["profile"] != binding.profile
+        or run["status"] != "running"
+        or run["ended_at"] is not None
+        or run["claim_lock"] != binding.claim_lock
+        or run["claim_expires"] is None
+        or int(run["claim_expires"]) < now
+        or run["worker_pid"] != binding.pid
+    ):
+        return None, "run ownership is stale or inconsistent"
+    return task, None
+
+
+def _normalize_restricted_result(
+    record: dict[str, Any],
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Redact and strictly bound the two accepted lifecycle payload shapes."""
+    from agent.redact import redact_sensitive_text
+
+    action = record["action"]
+    payload = record["payload"]
+    if action == "complete":
+        allowed = {"summary", "result", "metadata", "artifacts", "created_cards"}
+        if set(payload) - allowed:
+            return None, "completion payload contains unsupported fields"
+        summary = payload.get("summary")
+        result = payload.get("result")
+        if summary:
+            summary = redact_sensitive_text(str(summary), force=True)
+        if result:
+            result = redact_sensitive_text(str(result), force=True)
+        if not (summary or result):
+            return None, "completion requires summary or result"
+        metadata = payload.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            return None, "completion metadata must be an object"
+        if metadata is not None:
+            redacted = redact_sensitive_text(
+                json.dumps(metadata, ensure_ascii=False), force=True,
+            )
+            try:
+                metadata = json.loads(redacted)
+            except json.JSONDecodeError:
+                return None, "completion metadata could not be redacted safely"
+        created_cards = payload.get("created_cards") or []
+        if created_cards:
+            return None, "restricted workers cannot claim created cards"
+        artifacts = payload.get("artifacts") or []
+        if isinstance(artifacts, str):
+            artifacts = [artifacts]
+        if not isinstance(artifacts, list) or not all(isinstance(p, str) for p in artifacts):
+            return None, "completion artifacts must be a list of paths"
+        if artifacts:
+            metadata = dict(metadata or {})
+            metadata["artifacts"] = [p.strip() for p in artifacts if p.strip()]
+        return {
+            "action": action,
+            "summary": summary,
+            "result": result,
+            "metadata": metadata,
+        }, None
+
+    allowed = {"reason", "kind"}
+    if set(payload) - allowed:
+        return None, "block payload contains unsupported fields"
+    reason = payload.get("reason")
+    if not reason or not str(reason).strip():
+        return None, "block requires a reason"
+    reason = redact_sensitive_text(str(reason), force=True)
+    kind = payload.get("kind")
+    if kind is not None and kind not in VALID_BLOCK_KINDS:
+        return None, "invalid block kind"
+    return {"action": action, "reason": reason, "kind": kind}, None
+
+
+def _apply_restricted_worker_result(
+    conn: sqlite3.Connection,
+    binding: RestrictedWorkerBinding,
+    record: dict[str, Any],
+) -> tuple[bool, Optional[str]]:
+    task, error = _validate_restricted_binding(conn, binding)
+    if error:
+        return False, error
+    normalized, error = _normalize_restricted_result(record)
+    if error or normalized is None:
+        return False, error or "invalid lifecycle result"
+
+    if normalized["action"] == "complete":
+        # Preserve the existing goal-mode exit gate. This is intentionally a
+        # lazy import so the DB kernel does not acquire a module dependency on
+        # the tool registry during normal operation.
+        if task and task.goal_mode:
+            try:
+                from tools.kanban_tools import _goal_judge_available
+                from hermes_cli.goals import judge_goal
+
+                if _goal_judge_available():
+                    verdict, reason, _, _, _ = judge_goal(
+                        goal=f"{task.title}\n\n{task.body or ''}".strip(),
+                        last_response=(
+                            normalized.get("summary") or normalized.get("result") or ""
+                        ).strip(),
+                    )
+                    if verdict != "done":
+                        return False, f"goal completion rejected: {reason}"
+            except Exception as exc:
+                _log.warning(
+                    "restricted lifecycle goal judge failed open: %s", exc,
+                    exc_info=True,
+                )
+        try:
+            ok = complete_task(
+                conn,
+                binding.task_id,
+                result=normalized.get("result"),
+                summary=normalized.get("summary"),
+                metadata=normalized.get("metadata"),
+                created_cards=[],
+                expected_run_id=binding.run_id,
+                expected_binding=binding,
+            )
+        except ArtifactPreservationError as exc:
+            return False, str(exc)
+    else:
+        if (
+            task
+            and task.goal_mode
+            and normalized.get("kind") not in {"dependency", "needs_input"}
+        ):
+            return False, "goal-mode block kind is not permitted"
+        ok = block_task(
+            conn,
+            binding.task_id,
+            reason=normalized["reason"],
+            kind=normalized.get("kind"),
+            expected_run_id=binding.run_id,
+            expected_binding=binding,
+        )
+    return (True, None) if ok else (False, "claim-bound lifecycle CAS refused")
+
+
+def _connection_main_db_path(conn: sqlite3.Connection) -> Optional[str]:
+    """Return the canonical filesystem path for a connection's main DB."""
+    try:
+        for row in conn.execute("PRAGMA database_list").fetchall():
+            name = row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            path = row["file"] if isinstance(row, sqlite3.Row) else row[2]
+            if name == "main" and path:
+                return os.path.realpath(str(path))
+    except sqlite3.Error:
+        _log.debug("could not resolve dispatcher connection DB", exc_info=True)
+    return None
+
+
+def process_restricted_worker_results(conn: sqlite3.Connection) -> list[str]:
+    """Finalize cleanly-exited restricted workers before crash accounting."""
+    finalized: list[str] = []
+    current_db_path = _connection_main_db_path(conn)
+    if current_db_path is None:
+        return finalized
+    for pid, binding in list(_restricted_worker_bindings.items()):
+        if binding.board_db_path != current_db_path:
+            continue
+        kind, _code = _classify_worker_exit(pid)
+        if kind == "unknown" and _pid_alive(pid):
+            continue
+        if kind != "clean_exit":
+            if kind != "unknown" or not _pid_alive(pid):
+                _restricted_worker_bindings.pop(pid, None)
+                try:
+                    binding.channel.close()
+                except Exception:
+                    pass
+            continue
+        record, error = _read_restricted_worker_result(binding)
+        if error is None and record is not None:
+            ok, error = _apply_restricted_worker_result(conn, binding, record)
+            if ok:
+                finalized.append(binding.task_id)
+        if error:
+            try:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        binding.task_id,
+                        "lifecycle_result_refused",
+                        {"reason": error[:300]},
+                        run_id=binding.run_id,
+                    )
+            except Exception:
+                _log.debug("could not record lifecycle refusal", exc_info=True)
+        _restricted_worker_bindings.pop(pid, None)
+        try:
+            binding.channel.close()
+        except Exception:
+            pass
+    return finalized
+
+
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
 
@@ -7379,6 +7802,19 @@ def detect_stale_running(
         pid = row["worker_pid"]
         tid = row["id"]
         lock = row["claim_lock"] or ""
+
+        # Restricted workers deliberately do not write DB heartbeats. Their
+        # dispatcher-owned spawn binding plus a live host PID is the liveness
+        # signal, so the heartbeat-gap watchdog must not falsely reclaim them.
+        # Per-task max_runtime and crash detection remain the hard bounds.
+        binding = _restricted_worker_bindings.get(int(pid)) if pid else None
+        if (
+            binding is not None
+            and binding.task_id == tid
+            and binding.claim_lock == lock
+            and _pid_alive(int(pid))
+        ):
+            continue
 
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
@@ -8331,6 +8767,11 @@ def _dispatch_once_locked(
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
 
+    # A restricted worker cannot finalize its own DB row. Consume its bounded
+    # result first so a clean exit with a valid handoff is not misclassified as
+    # the legacy "exited without complete/block" protocol violation below.
+    process_restricted_worker_results(conn)
+
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
@@ -8572,10 +9013,14 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                spawn_kwargs: dict[str, Any] = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    spawn_kwargs["board"] = board
+                if "worker_context" in sig.parameters:
+                    spawn_kwargs["worker_context"] = build_worker_context(
+                        conn, claimed.id,
+                    )
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -8667,10 +9112,14 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                spawn_kwargs: dict[str, Any] = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    spawn_kwargs["board"] = board
+                if "worker_context" in sig.parameters:
+                    spawn_kwargs["worker_context"] = build_worker_context(
+                        conn, claimed.id,
+                    )
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -8975,23 +9424,104 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def restricted_worker_config(
+    kanban_cfg: Optional[dict] = None,
+) -> tuple[bool, str]:
+    """Return the user-facing restricted-worker config.yaml binding."""
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            kanban_cfg = (load_config().get("kanban") or {})
+        except Exception:
+            kanban_cfg = {}
+    raw = (kanban_cfg or {}).get("restricted_workers") or {}
+    if not isinstance(raw, dict):
+        return False, ""
+    return raw.get("enabled") is True, str(raw.get("os_user") or "").strip()
+
+
+def _resolve_restricted_worker_uid(launcher: str, worker_user: str) -> int:
+    """Validate the reviewed launcher posture and resolve its target UID."""
+    import pwd
+
+    get_effective_uid = getattr(os, "geteuid", None)
+    if get_effective_uid is None:
+        raise RuntimeError("restricted Kanban workers require a POSIX OS identity")
+    dispatcher_uid = int(get_effective_uid())
+
+    real_launcher = os.path.realpath(launcher)
+    if real_launcher != launcher:
+        raise RuntimeError(
+            "restricted HERMES_BIN must be an absolute canonical path without symlinks"
+        )
+    # A safe leaf is insufficient when an attacker can replace it through a
+    # writable ancestor between validation and exec.  Requiring the complete
+    # canonical path to be root-owned and non-group/world-writable makes that
+    # interval immutable to both dispatcher and worker UIDs.
+    current = os.path.sep
+    try:
+        for component in os.path.normpath(launcher).split(os.path.sep)[1:]:
+            current = os.path.join(current, component)
+            entry = os.lstat(current)
+            if entry.st_uid != 0 or entry.st_mode & 0o022:
+                raise RuntimeError(
+                    "restricted HERMES_BIN and every parent must be root-owned "
+                    "and non-group/world-writable"
+                )
+    except OSError as exc:
+        raise RuntimeError("restricted HERMES_BIN launcher is unavailable") from exc
+    if not os.path.isfile(launcher):
+        raise RuntimeError("restricted HERMES_BIN launcher is not a regular file")
+    if not worker_user:
+        raise RuntimeError("restricted Kanban workers require an expected OS user")
+    try:
+        restricted_uid = int(pwd.getpwnam(worker_user).pw_uid)
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError("restricted Kanban worker OS user does not exist") from exc
+    if restricted_uid in {0, dispatcher_uid}:
+        raise RuntimeError(
+            "restricted Kanban worker OS user must differ from root and dispatcher"
+        )
+    return restricted_uid
+
+
+def _create_restricted_control_channel():
+    """Create the Linux credential-authenticated parent/child socket pair."""
+    import socket
+
+    if sys.platform != "linux":
+        raise RuntimeError(
+            "restricted Kanban lifecycle requires Linux SCM_CREDENTIALS"
+        )
+    if not hasattr(socket, "SO_PASSCRED") or not hasattr(socket, "SCM_CREDENTIALS"):
+        raise RuntimeError("restricted lifecycle sender credentials are unavailable")
+    parent_channel, child_channel = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_DGRAM,
+    )
+    parent_channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    parent_channel.setblocking(False)
+    return parent_channel, child_channel
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
     *,
     board: Optional[str] = None,
+    worker_context: Optional[str] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the spawned child's PID so the dispatcher can detect crashes
-    before the claim TTL expires. The child's completion is still observed
-    via the ``complete`` / ``block`` transitions the worker writes itself;
-    the PID check is a safety net for crashes, OOM kills, and Ctrl+C.
+    before the claim TTL expires. Normal workers still write complete/block
+    directly. Opt-in restricted workers instead return one credential-bound
+    datagram on the socket inherited as stdin; the dispatcher finalizes them.
 
-    ``board`` pins the child's kanban context to that board: the child's
+    For normal workers, ``board`` pins the child's kanban context: the child's
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
-    vars all resolve to the same board the dispatcher claimed the task
-    from. Workers cannot accidentally see other boards.
+    vars all resolve to the same board the dispatcher claimed the task from.
+    Restricted workers receive none of those board locators.
     """
     import subprocess
     if not task.assignee:
@@ -9099,6 +9629,43 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    from hermes_cli.kanban_lifecycle import (
+        CONTEXT_ENV,
+        RESTRICTED_WORKER_ENV,
+        bounded_context,
+    )
+    restricted_worker, restricted_user = restricted_worker_config()
+    restricted_uid: Optional[int] = None
+    if restricted_worker:
+        if task.max_runtime_seconds is None or int(task.max_runtime_seconds) <= 0:
+            raise RuntimeError(
+                "restricted Kanban workers require a positive max_runtime_seconds"
+            )
+        launcher = os.environ.get("HERMES_BIN", "").strip()
+        if not launcher or not os.path.isabs(launcher):
+            raise RuntimeError(
+                "restricted Kanban workers require an absolute, operator-owned "
+                "HERMES_BIN launcher that enters the reviewed OS identity"
+            )
+        restricted_uid = _resolve_restricted_worker_uid(launcher, restricted_user)
+        # The fixed restricted UID is unable to traverse the board directory.
+        # Remove every board locator and claim credential as defense in depth;
+        # the child needs only its task/workspace plus a read-only context
+        # snapshot and bounded lifecycle tools.
+        for key in (
+            "HERMES_KANBAN_DB",
+            "HERMES_KANBAN_HOME",
+            "HERMES_KANBAN_WORKSPACES_ROOT",
+            "HERMES_KANBAN_ATTACHMENTS_ROOT",
+            "HERMES_KANBAN_BOARD",
+            "HERMES_KANBAN_CLAIM_LOCK",
+            "HERMES_KANBAN_RUN_ID",
+        ):
+            env.pop(key, None)
+        env[RESTRICTED_WORKER_ENV] = "1"
+        if worker_context:
+            env[CONTEXT_ENV] = bounded_context(worker_context)
+
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
     # quiet chat run into the Ink TUI, whose no-TTY bail-out exits 0 without
@@ -9165,11 +9732,15 @@ def _default_spawn(
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
+    parent_channel = None
+    child_channel = None
+    if restricted_worker:
+        parent_channel, child_channel = _create_restricted_control_channel()
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
+            stdin=child_channel if restricted_worker else subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
             env=env,
@@ -9178,10 +9749,37 @@ def _default_spawn(
         )
     except FileNotFoundError:
         log_f.close()
+        if parent_channel is not None:
+            parent_channel.close()
+        if child_channel is not None:
+            child_channel.close()
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    except Exception:
+        log_f.close()
+        if parent_channel is not None:
+            parent_channel.close()
+        if child_channel is not None:
+            child_channel.close()
+        raise
+    if child_channel is not None:
+        child_channel.close()
+    if restricted_worker:
+        try:
+            _register_restricted_worker(
+                pid=proc.pid,
+                task=task,
+                workspace=workspace,
+                board_db_path=str(kanban_db_path(board=board)),
+                expected_uid=int(restricted_uid),
+                channel=parent_channel,
+            )
+        except Exception:
+            if parent_channel is not None:
+                parent_channel.close()
+            raise
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's
