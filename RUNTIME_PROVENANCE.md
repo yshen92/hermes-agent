@@ -8,7 +8,7 @@ exact_r0_commit: 01edcadbd194f81bd7eceb9ca267737830ce24c0
 exact_r0_remote:
   repository: yshen92/hermes-agent
   ref: refs/heads/r0-evidence/v2026.8.3-01edcad
-final_phase10_2a_runtime_candidate: 819fe5c1fe0f442674c3b00f24c6d6858faa0359
+final_phase10_2a_runtime_candidate: fe085446b864cb7d31f57499e407ce0f7275c511
 ```
 
 The final runtime candidate has the exact immutable ancestry:
@@ -18,7 +18,11 @@ The final runtime candidate has the exact immutable ancestry:
 3. Phase 10.2A-local implementation commit `b5e3ab783...`;
 4. deterministic CI correction `819fe5c1f...`, which makes the POSIX identity
    guard Windows-safe and compares contributor attribution to the actual PR
-   base without changing the runtime authority model.
+   base without changing the runtime authority model;
+5. review hardening `fe085446b...`, which binds lifecycle control channels to
+   their board database, contains artifact-preservation refusals, rejects
+   created-card claims before handoff, and normalizes restricted prompt-mode
+   detection.
 
 The R0 commit was fetched from the preserved evidence ref and was not
 reconstructed, amended, squashed or rebased. No behaviorally equivalent R0
