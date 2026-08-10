@@ -64,8 +64,7 @@ WAL/SHM paths. This PR does not create that identity or mutate a host.
 
 ## Verdict
 
-The Phase 10.2A source design is ready for review subject to tests. The local
-delivery candidate and PR remain blocked until the exact qualified R0 object
-is available, as recorded in `RUNTIME_PROVENANCE.md`. Activation is separately
-blocked on a reviewed Phase 10.1 binding revision and its real restricted-UID
-raw-SQL/CLI/import integration proof. No live deployment is authorized.
+The Phase 10.2A source design and exact-R0 candidate are ready for review
+subject to final tests. Activation remains separately blocked on a reviewed
+Phase 10.1 binding revision and its real restricted-UID raw-SQL/CLI/import
+integration proof. No live deployment is authorized.
