@@ -733,6 +733,8 @@ def _handle_complete(args: dict, **kw) -> str:
         if is_restricted_worker():
             if board:
                 return tool_error("restricted workers cannot select a board")
+            if created_cards:
+                return tool_error("restricted workers cannot claim created cards")
             emit_result(
                 "complete",
                 {

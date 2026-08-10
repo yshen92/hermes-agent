@@ -6987,6 +6987,7 @@ class RestrictedWorkerBinding:
     profile: str
     workspace_path: str
     workspace: str
+    board_db_path: str
     claim_lock: str
     expected_uid: int
     channel: Any
@@ -7000,6 +7001,7 @@ def _register_restricted_worker(
     pid: int,
     task: Task,
     workspace: str,
+    board_db_path: str,
     expected_uid: int,
     channel: Any,
 ) -> None:
@@ -7017,6 +7019,7 @@ def _register_restricted_worker(
         profile=task.assignee,
         workspace_path=workspace,
         workspace=os.path.realpath(workspace),
+        board_db_path=os.path.realpath(board_db_path),
         claim_lock=task.claim_lock,
         expected_uid=int(expected_uid),
         channel=channel,
@@ -7206,16 +7209,19 @@ def _apply_restricted_worker_result(
                     "restricted lifecycle goal judge failed open: %s", exc,
                     exc_info=True,
                 )
-        ok = complete_task(
-            conn,
-            binding.task_id,
-            result=normalized.get("result"),
-            summary=normalized.get("summary"),
-            metadata=normalized.get("metadata"),
-            created_cards=[],
-            expected_run_id=binding.run_id,
-            expected_binding=binding,
-        )
+        try:
+            ok = complete_task(
+                conn,
+                binding.task_id,
+                result=normalized.get("result"),
+                summary=normalized.get("summary"),
+                metadata=normalized.get("metadata"),
+                created_cards=[],
+                expected_run_id=binding.run_id,
+                expected_binding=binding,
+            )
+        except ArtifactPreservationError as exc:
+            return False, str(exc)
     else:
         if (
             task
@@ -7234,10 +7240,28 @@ def _apply_restricted_worker_result(
     return (True, None) if ok else (False, "claim-bound lifecycle CAS refused")
 
 
+def _connection_main_db_path(conn: sqlite3.Connection) -> Optional[str]:
+    """Return the canonical filesystem path for a connection's main DB."""
+    try:
+        for row in conn.execute("PRAGMA database_list").fetchall():
+            name = row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            path = row["file"] if isinstance(row, sqlite3.Row) else row[2]
+            if name == "main" and path:
+                return os.path.realpath(str(path))
+    except sqlite3.Error:
+        _log.debug("could not resolve dispatcher connection DB", exc_info=True)
+    return None
+
+
 def process_restricted_worker_results(conn: sqlite3.Connection) -> list[str]:
     """Finalize cleanly-exited restricted workers before crash accounting."""
     finalized: list[str] = []
+    current_db_path = _connection_main_db_path(conn)
+    if current_db_path is None:
+        return finalized
     for pid, binding in list(_restricted_worker_bindings.items()):
+        if binding.board_db_path != current_db_path:
+            continue
         kind, _code = _classify_worker_exit(pid)
         if kind == "unknown" and _pid_alive(pid):
             continue
@@ -9748,6 +9772,7 @@ def _default_spawn(
                 pid=proc.pid,
                 task=task,
                 workspace=workspace,
+                board_db_path=str(kanban_db_path(board=board)),
                 expected_uid=int(restricted_uid),
                 channel=parent_channel,
             )

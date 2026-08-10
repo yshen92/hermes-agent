@@ -56,6 +56,18 @@ from utils import is_truthy_value
 logger = logging.getLogger(__name__)
 
 
+def _is_restricted_kanban_worker() -> bool:
+    """Use the lifecycle parser so false-like env values stay non-restricted."""
+    try:
+        from hermes_cli.kanban_lifecycle import is_restricted_worker
+
+        return is_restricted_worker()
+    except ImportError:
+        # Fail closed if the lifecycle module is unavailable in a partial
+        # installation, matching the DB/tool-layer import fallbacks.
+        return bool(os.environ.get("HERMES_KANBAN_RESTRICTED_WORKER"))
+
+
 def _ra():
     """Lazy reference to the ``run_agent`` module.
 
@@ -244,7 +256,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(KANBAN_GUIDANCE)
     elif (
         _kanban_guidance is None
-        and os.environ.get("HERMES_KANBAN_RESTRICTED_WORKER")
+        and _is_restricted_kanban_worker()
         and "kanban_complete" in agent.valid_tool_names
     ):
         context = os.environ.get("HERMES_KANBAN_CONTEXT", "").strip()

@@ -62,6 +62,7 @@ def _claimed_binding(
         profile=assignee,
         workspace_path=str(workspace),
         workspace=os.path.realpath(workspace),
+        board_db_path=kb._connection_main_db_path(conn),
         claim_lock=current.claim_lock,
         expected_uid=12345,
         channel=_DummyChannel(),
@@ -118,6 +119,25 @@ def test_restricted_complete_emits_identity_free_bounded_result(
     assert "task" not in record and "run" not in record and "claim" not in record
 
 
+def test_restricted_complete_rejects_created_cards_before_handoff(monkeypatch):
+    emitted = []
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_own")
+    monkeypatch.setenv(lifecycle.RESTRICTED_WORKER_ENV, "1")
+    monkeypatch.setattr(
+        lifecycle,
+        "emit_result",
+        lambda action, payload: emitted.append((action, payload)),
+    )
+
+    response = json.loads(kanban_tools._handle_complete({
+        "summary": "done",
+        "created_cards": ["t_sibling"],
+    }))
+
+    assert "cannot claim created cards" in response["error"]
+    assert emitted == []
+
+
 def test_claim_bound_complete_reuses_canonical_artifact_cleanup_and_redaction(
     kanban_home, tmp_path, monkeypatch,
 ):
@@ -161,6 +181,63 @@ def test_claim_bound_complete_reuses_canonical_artifact_cleanup_and_redaction(
         ]
     assert not workspace.exists()
     assert preserved.read_text(encoding="utf-8") == "deliverable"
+
+
+def test_artifact_preservation_failure_refuses_result_without_aborting_tick(
+    kanban_home, tmp_path, monkeypatch,
+):
+    credential_kind = getattr(socket, "SCM_CREDENTIALS", 0x02)
+    monkeypatch.setattr(socket, "SCM_CREDENTIALS", credential_kind, raising=False)
+
+    with kb.connect() as conn:
+        tid, workspace, original = _claimed_binding(conn, tmp_path, scratch=True)
+        record = {
+            "action": "complete",
+            "payload": {
+                "summary": "finished",
+                "artifacts": [str(workspace / "missing.txt")],
+            },
+        }
+
+        class CredentialChannel:
+            def recvmsg(self, *_args):
+                return (
+                    json.dumps(record).encode(),
+                    [(socket.SOL_SOCKET, credential_kind,
+                      struct.pack("3i", binding.pid, binding.expected_uid, 1))],
+                    0,
+                    None,
+                )
+
+            def recv(self, _size):
+                raise BlockingIOError
+
+            def close(self):
+                pass
+
+        values = dict(original.__dict__)
+        values["channel"] = CredentialChannel()
+        binding = kb.RestrictedWorkerBinding(**values)
+        kb._restricted_worker_bindings[binding.pid] = binding
+        monkeypatch.setattr(
+            kb,
+            "_classify_worker_exit",
+            lambda pid: (
+                ("clean_exit", 0)
+                if pid == binding.pid
+                else ("unknown", None)
+            ),
+        )
+
+        assert kb.process_restricted_worker_results(conn) == []
+        assert kb.get_task(conn, tid).status == "running"
+        assert workspace.exists()
+        assert binding.pid not in kb._restricted_worker_bindings
+        refusal = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "lifecycle_result_refused"
+        ][-1]
+        assert "missing.txt" in refusal.payload["reason"]
 
 
 @pytest.mark.parametrize(
@@ -384,6 +461,65 @@ def test_dispatcher_consumes_clean_exit_result_before_crash_accounting(
         assert binding.pid not in kb._restricted_worker_bindings
 
 
+def test_dispatcher_processes_restricted_results_only_for_matching_board(
+    kanban_home, tmp_path, monkeypatch,
+):
+    kb.init_db(board="board-a")
+    kb.init_db(board="board-b")
+    credential_kind = getattr(socket, "SCM_CREDENTIALS", 0x02)
+    monkeypatch.setattr(socket, "SCM_CREDENTIALS", credential_kind, raising=False)
+
+    class CredentialChannel:
+        def __init__(self):
+            self.read = False
+
+        def recvmsg(self, *_args):
+            self.read = True
+            return (
+                json.dumps({
+                    "action": "complete",
+                    "payload": {"summary": "board B done"},
+                }).encode(),
+                [(socket.SOL_SOCKET, credential_kind,
+                  struct.pack("3i", binding.pid, binding.expected_uid, 1))],
+                0,
+                None,
+            )
+
+        def recv(self, _size):
+            raise BlockingIOError
+
+        def close(self):
+            pass
+
+    with kb.connect(board="board-b") as conn_b:
+        tid, _workspace, original = _claimed_binding(conn_b, tmp_path)
+        values = dict(original.__dict__)
+        channel = CredentialChannel()
+        values["channel"] = channel
+        binding = kb.RestrictedWorkerBinding(**values)
+        kb._restricted_worker_bindings[binding.pid] = binding
+
+    monkeypatch.setattr(
+        kb,
+        "_classify_worker_exit",
+        lambda pid: ("clean_exit", 0) if pid == binding.pid else ("unknown", None),
+    )
+    try:
+        with kb.connect(board="board-a") as conn_a:
+            assert kb.process_restricted_worker_results(conn_a) == []
+        assert channel.read is False
+        assert kb._restricted_worker_bindings[binding.pid] is binding
+
+        with kb.connect(board="board-b") as conn_b:
+            assert kb.process_restricted_worker_results(conn_b) == [tid]
+            assert kb.get_task(conn_b, tid).status == "done"
+        assert channel.read is True
+        assert binding.pid not in kb._restricted_worker_bindings
+    finally:
+        kb._restricted_worker_bindings.pop(binding.pid, None)
+
+
 def test_control_channel_refuses_sibling_sender_pid(monkeypatch, tmp_path):
     credential_kind = getattr(socket, "SCM_CREDENTIALS", 0x02)
     monkeypatch.setattr(socket, "SCM_CREDENTIALS", credential_kind, raising=False)
@@ -408,6 +544,7 @@ def test_control_channel_refuses_sibling_sender_pid(monkeypatch, tmp_path):
         profile="builder",
         workspace_path=str(tmp_path),
         workspace=str(tmp_path),
+        board_db_path=str(tmp_path / "kanban.db"),
         claim_lock="claim",
         expected_uid=12345,
         channel=SiblingChannel(),
@@ -432,6 +569,7 @@ def test_linux_control_channel_authenticates_actual_sender(monkeypatch, tmp_path
         profile="builder",
         workspace_path=str(tmp_path),
         workspace=str(tmp_path),
+        board_db_path=str(tmp_path / "kanban.db"),
         claim_lock="claim",
         expected_uid=os.getuid(),
         channel=parent,
@@ -505,6 +643,7 @@ def test_restricted_spawn_scrubs_board_authority_and_registers_parent_binding(
         assert registered.run_id == task.current_run_id
         assert registered.profile == task.assignee
         assert registered.workspace == os.path.realpath(workspace)
+        assert registered.board_db_path == os.path.realpath(kb.kanban_db_path())
         assert registered.expected_uid == 12345
         registered.channel.close()
 
@@ -547,6 +686,16 @@ def test_restricted_worker_mode_is_config_yaml_gated():
     assert kb.restricted_worker_config({
         "restricted_workers": {"enabled": True, "os_user": "worker"},
     }) == (True, "worker")
+
+
+@pytest.mark.parametrize("value", ["false", "0", "off", "no"])
+def test_false_like_restricted_env_does_not_select_restricted_prompt(
+    monkeypatch, value,
+):
+    from agent.system_prompt import _is_restricted_kanban_worker
+
+    monkeypatch.setenv(lifecycle.RESTRICTED_WORKER_ENV, value)
+    assert _is_restricted_kanban_worker() is False
 
 
 def test_restricted_spawn_requires_bounded_runtime(

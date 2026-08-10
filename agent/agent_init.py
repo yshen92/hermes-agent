@@ -1444,8 +1444,9 @@ def init_agent(
     # membership test + reference on every system-prompt rebuild
     # (init + each context compression).
     from agent.prompt_builder import KANBAN_GUIDANCE, RESTRICTED_KANBAN_GUIDANCE
+    from hermes_cli.kanban_lifecycle import is_restricted_worker
     if (
-        os.environ.get("HERMES_KANBAN_RESTRICTED_WORKER")
+        is_restricted_worker()
         and "kanban_complete" in agent.valid_tool_names
     ):
         context = os.environ.get("HERMES_KANBAN_CONTEXT", "").strip()
