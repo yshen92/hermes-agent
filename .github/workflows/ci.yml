@@ -122,6 +122,8 @@ jobs:
     needs: detect
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/contributor-check.yml
+    with:
+      base_sha: ${{ github.event.pull_request.base.sha }}
 
   uv-lockfile:
     name: Check uv.lock

@@ -9421,6 +9421,11 @@ def _resolve_restricted_worker_uid(launcher: str, worker_user: str) -> int:
     """Validate the reviewed launcher posture and resolve its target UID."""
     import pwd
 
+    get_effective_uid = getattr(os, "geteuid", None)
+    if get_effective_uid is None:
+        raise RuntimeError("restricted Kanban workers require a POSIX OS identity")
+    dispatcher_uid = int(get_effective_uid())
+
     real_launcher = os.path.realpath(launcher)
     if real_launcher != launcher:
         raise RuntimeError(
@@ -9450,7 +9455,7 @@ def _resolve_restricted_worker_uid(launcher: str, worker_user: str) -> int:
         restricted_uid = int(pwd.getpwnam(worker_user).pw_uid)
     except (KeyError, ValueError) as exc:
         raise RuntimeError("restricted Kanban worker OS user does not exist") from exc
-    if restricted_uid in {0, os.geteuid()}:
+    if restricted_uid in {0, dispatcher_uid}:
         raise RuntimeError(
             "restricted Kanban worker OS user must differ from root and dispatcher"
         )

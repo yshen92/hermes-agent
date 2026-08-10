@@ -2,6 +2,12 @@ name: Contributor Attribution Check
 
 on:
   workflow_call:
+    inputs:
+      base_sha:
+        description: "Exact pull-request base SHA; empty for non-PR callers"
+        required: false
+        type: string
+        default: ""
     outputs:
       review_status:
         description: "JSON array of review status objects"
@@ -23,9 +29,16 @@ jobs:
 
       - name: Check for unmapped contributor emails
         id: check-emails
+        env:
+          PR_BASE_SHA: ${{ inputs.base_sha }}
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # A PR may deliberately target a maintenance/release branch. Compare
+          # against the caller-provided PR base, not an unrelated origin/main.
+          if [ -n "$PR_BASE_SHA" ]; then
+            MERGE_BASE=$(git merge-base "$PR_BASE_SHA" HEAD)
+          else
+            MERGE_BASE=$(git merge-base origin/main HEAD)
+          fi
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
