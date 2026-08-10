@@ -306,6 +306,21 @@ KANBAN_GUIDANCE = (
     "cross-agent handoffs that outlive one API loop."
 )
 
+RESTRICTED_KANBAN_GUIDANCE = (
+    "# Restricted Kanban task execution protocol\n"
+    "You have one dispatcher-owned task. Its trusted context snapshot follows "
+    "below. Work only inside `$HERMES_KANBAN_WORKSPACE`. The shared board is "
+    "intentionally inaccessible: do not open SQLite, import Kanban mutators, "
+    "or shell out to `hermes kanban`. Only `kanban_complete`, `kanban_block`, "
+    "and `kanban_heartbeat` are available. Complete/block returns a bounded "
+    "result to the trusted dispatcher, which validates your current task, run, "
+    "profile, workspace, claim and process before applying the canonical "
+    "lifecycle transition. Heartbeat is satisfied by dispatcher PID liveness.\n"
+    "Do not create, retarget, link/unlink, unblock, assign, or mutate another "
+    "task. If follow-up work is needed, describe it in your completion or block "
+    "handoff for the orchestrator. Emit exactly one complete or block result.\n"
+)
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "

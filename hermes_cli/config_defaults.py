@@ -2248,6 +2248,13 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Run native Kanban workers under the separately reviewed restricted
+        # OS launcher/identity. Disabled until the host binding proves that the
+        # configured identity cannot traverse or write the board DB/WAL/SHM.
+        "restricted_workers": {
+            "enabled": False,
+            "os_user": "",
+        },
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The
@@ -3122,7 +3129,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 33,
+    "_config_version": 34,
 }
 
 # Optional environment variables that enhance functionality

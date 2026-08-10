@@ -108,6 +108,19 @@ def _check_kanban_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _check_kanban_direct_mode() -> bool:
+    """DB-backed worker tools are unavailable in the restricted binding."""
+    try:
+        from hermes_cli.kanban_lifecycle import is_restricted_worker
+
+        if is_restricted_worker():
+            return False
+    except Exception:
+        if os.environ.get("HERMES_KANBAN_RESTRICTED_WORKER"):
+            return False
+    return _check_kanban_mode()
+
+
 def _check_kanban_orchestrator_mode() -> bool:
     """Board-routing tools (kanban_list, kanban_unblock) are intentionally
     hidden from task workers.
@@ -283,6 +296,14 @@ def heartbeat_current_worker_from_env() -> bool:
     the worst case is one extra DB write per race, which is harmless.
     """
     global _auto_heartbeat_last_attempt
+    try:
+        from hermes_cli.kanban_lifecycle import is_restricted_worker
+
+        if is_restricted_worker():
+            # The dispatcher already owns PID liveness and extends live claims.
+            return False
+    except Exception:
+        pass
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid:
         return False
@@ -707,6 +728,25 @@ def _handle_complete(args: dict, **kw) -> str:
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
+        from hermes_cli.kanban_lifecycle import emit_result, is_restricted_worker
+
+        if is_restricted_worker():
+            if board:
+                return tool_error("restricted workers cannot select a board")
+            emit_result(
+                "complete",
+                {
+                    "summary": summary,
+                    "result": result,
+                    "metadata": metadata,
+                    "created_cards": created_cards or [],
+                    "artifacts": artifacts or [],
+                },
+            )
+            return _ok(task_id=tid, status="pending_dispatcher", action="complete")
+    except (ValueError, RuntimeError) as exc:
+        return tool_error(f"kanban_complete: {exc}")
+    try:
         kb, conn = _connect(board=board)
         try:
             # Goal-mode pre-completion judge gate (Issue #38367).
@@ -814,6 +854,20 @@ def _handle_block(args: dict, **kw) -> str:
     kind = args.get("kind")
     board = args.get("board")
     try:
+        from hermes_cli.kanban_lifecycle import emit_result, is_restricted_worker
+
+        if is_restricted_worker():
+            if board:
+                return tool_error("restricted workers cannot select a board")
+            if kind is not None and kind not in {
+                "dependency", "needs_input", "capability", "transient",
+            }:
+                return tool_error("invalid block kind")
+            emit_result("block", {"reason": reason, "kind": kind})
+            return _ok(task_id=tid, status="pending_dispatcher", action="block")
+    except (ValueError, RuntimeError) as exc:
+        return tool_error(f"kanban_block: {exc}")
+    try:
         kb, conn = _connect(board=board)
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
             conn.close()
@@ -898,6 +952,19 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return ownership_err
     note = args.get("note")
     board = args.get("board")
+    try:
+        from hermes_cli.kanban_lifecycle import is_restricted_worker
+
+        if is_restricted_worker():
+            if board:
+                return tool_error("restricted workers cannot select a board")
+            return _ok(
+                task_id=tid,
+                status="alive",
+                liveness="dispatcher_pid_supervision",
+            )
+    except Exception:
+        pass
     try:
         kb, conn = _connect(board=board)
         try:
@@ -2131,7 +2198,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_SHOW_SCHEMA,
     handler=_handle_show,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_direct_mode,
     emoji="📋",
 )
 
@@ -2176,7 +2243,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_COMMENT_SCHEMA,
     handler=_handle_comment,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_direct_mode,
     emoji="💬",
 )
 
@@ -2185,7 +2252,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_ATTACH_SCHEMA,
     handler=_handle_attach,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_direct_mode,
     emoji="📎",
 )
 
@@ -2194,7 +2261,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_ATTACH_URL_SCHEMA,
     handler=_handle_attach_url,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_direct_mode,
     emoji="📎",
 )
 
@@ -2203,7 +2270,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_ATTACHMENTS_SCHEMA,
     handler=_handle_attachments,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_direct_mode,
     emoji="📎",
 )
 
@@ -2212,7 +2279,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_direct_mode,
     emoji="➕",
 )
 
@@ -2230,6 +2297,6 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
     handler=_handle_link,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_direct_mode,
     emoji="🔗",
 )
