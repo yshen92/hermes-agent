@@ -2708,24 +2708,28 @@ def _run_pre_update_backup(args) -> Optional[str]:
     return snapshot_id
 
 def _write_update_planned_stop_marker(profile_path: Path, pid: int) -> bool:
-    """Write a planned-stop marker into a specific profile home."""
+    """Write a planned-stop marker into a specific profile home.
+
+    Goes through ``gateway.planned_stop_protocol`` rather than assembling the
+    record here, so this writer cannot drift from the gateway that reads it.
+    ``profile_path`` always belongs to a gateway we just found running, so the
+    protocol writer's refusal to create a missing parent directory is what we
+    want: no such directory means the process we are pausing is not the one we
+    think it is.
+    """
     try:
-        from datetime import timezone
-
+        from gateway.planned_stop_protocol import (
+            PLANNED_STOP_MARKER_FILENAME,
+            build_planned_stop_record,
+            write_marker_atomic,
+        )
         from gateway.status import _get_process_start_time
-        from utils import atomic_json_write
 
-        record = {
-            "target_pid": pid,
-            "target_start_time": _get_process_start_time(pid),
-            "stopper_pid": os.getpid(),
-            "written_at": datetime.now(timezone.utc).isoformat(),
-        }
-        atomic_json_write(
-            Path(profile_path) / ".gateway-planned-stop.json",
-            record,
-            indent=None,
-            separators=(",", ":"),
+        record = build_planned_stop_record(
+            pid, _get_process_start_time(pid), os.getpid()
+        )
+        write_marker_atomic(
+            Path(profile_path) / PLANNED_STOP_MARKER_FILENAME, record
         )
         return True
     except (OSError, PermissionError):

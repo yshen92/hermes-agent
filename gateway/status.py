@@ -28,6 +28,16 @@ from pathlib import Path
 from hermes_constants import get_hermes_home, _get_platform_default_hermes_home
 from typing import Any, Callable, NamedTuple, Optional
 from utils import atomic_json_write
+from gateway.planned_stop_protocol import (
+    PLANNED_STOP_MARKER_FILENAME as _PLANNED_STOP_MARKER_FILENAME,
+    PLANNED_STOP_MARKER_TTL_S as _PLANNED_STOP_MARKER_TTL_S,
+    build_planned_stop_record,
+    linux_process_start_time,
+    marker_is_stale as _marker_is_stale,
+    pid_marker_matches,
+    utc_now_iso,
+    write_marker_atomic,
+)
 
 if sys.platform == "win32":
     import msvcrt
@@ -185,7 +195,7 @@ def _get_lock_dir() -> Path:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now_iso()
 
 
 # Reject epoch values before 2000-01-01T00:00:00Z: nothing in Hermes' lifetime
@@ -303,12 +313,12 @@ def _get_process_start_time(pid: int) -> Optional[int]:
     spawn against the live value *on the same host*, the differing units across
     platforms are irrelevant — only same-source equality matters.
     """
-    stat_path = Path(f"/proc/{pid}/stat")
-    try:
-        # Field 22 in /proc/<pid>/stat is process start time (clock ticks).
-        return int(stat_path.read_text(encoding="utf-8").split()[21])
-    except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
-        pass
+    # Field 22 in /proc/<pid>/stat is process start time (clock ticks). The
+    # observation lives in gateway.planned_stop_protocol so an out-of-tree
+    # stopper fingerprints the target exactly the way this process does.
+    linux_start_time = linux_process_start_time(pid)
+    if linux_start_time is not None:
+        return linux_start_time
 
     # No /proc (macOS / Windows): psutil is a hard dependency and exposes a
     # cross-platform creation time.  Quantize to centiseconds so repeated reads
@@ -1577,8 +1587,10 @@ def release_all_scoped_locks(
 
 _TAKEOVER_MARKER_FILENAME = ".gateway-takeover.json"
 _TAKEOVER_MARKER_TTL_S = 60  # Marker older than this is treated as stale
-_PLANNED_STOP_MARKER_FILENAME = ".gateway-planned-stop.json"
-_PLANNED_STOP_MARKER_TTL_S = 60
+# _PLANNED_STOP_MARKER_FILENAME / _PLANNED_STOP_MARKER_TTL_S are imported at
+# the top of this module from gateway.planned_stop_protocol, which owns the
+# planned-stop wire format so an out-of-tree stopper and this process cannot
+# drift apart.
 
 
 def _get_takeover_marker_path(hermes_home: Optional[Path] = None) -> Path:
@@ -1595,15 +1607,6 @@ def _get_planned_stop_marker_path() -> Path:
     """Return the path to the intentional gateway stop marker file."""
     home = _get_process_hermes_home()
     return home / _PLANNED_STOP_MARKER_FILENAME
-
-
-def _marker_is_stale(written_at: str, ttl_s: int) -> bool:
-    try:
-        written_dt = datetime.fromisoformat(written_at)
-        age = (datetime.now(timezone.utc) - written_dt).total_seconds()
-        return age > ttl_s
-    except (TypeError, ValueError):
-        return True
 
 
 def _consume_pid_marker_for_self(
@@ -1655,25 +1658,17 @@ def _consume_pid_marker_for_self(
             return False
 
     our_pid = os.getpid()
-    our_start_time = _get_process_start_time(our_pid)
-    # Start-time is a PID-reuse guard. It is only meaningful when both
-    # sides actually have it: ``_get_process_start_time`` returns None on
-    # platforms without ``/proc`` (macOS, native Windows — the very
-    # platform the planned-stop watcher exists for). Requiring a non-None
-    # match there would make every consume return False, so a legitimate
-    # ``hermes gateway stop`` on Windows would be misclassified as an
-    # unexpected ``UNKNOWN`` exit (exit 1) and revived by the service
-    # manager. So: when both start_times are known they must match; when
-    # either is unknown, fall back to PID equality alone (bounded by the
-    # marker's short TTL). This mirrors ``planned_stop_marker_targets_self``
-    # so the watcher's non-destructive probe and this authoritative
-    # consume agree on every platform (issue #34597).
-    if target_pid != our_pid:
-        matches = False
-    elif target_start_time is not None and our_start_time is not None:
-        matches = target_start_time == our_start_time
-    else:
-        matches = True
+    # ``pid_marker_matches`` is the single definition of the identity rule
+    # (PID always; start-time only when both sides have one — see issue
+    # #34597), shared with ``planned_stop_marker_targets_self`` so the
+    # watcher's non-destructive probe and this authoritative consume can
+    # never disagree, and with the out-of-tree stopper that writes markers.
+    matches = pid_marker_matches(
+        target_pid,
+        target_start_time,
+        our_pid,
+        _get_process_start_time(our_pid),
+    )
 
     try:
         path.unlink(missing_ok=True)
@@ -2060,16 +2055,22 @@ def write_planned_stop_marker(target_pid: int) -> bool:
     The gateway exits non-zero for unexpected SIGTERM so service managers can
     revive it. Service stop commands send the same SIGTERM, so the CLI writes
     this short-lived marker first to let the target process exit cleanly.
+
+    The record and the write both come from ``gateway.planned_stop_protocol``,
+    the shared definition of this marker's wire format. Unlike the other
+    identity files here, that writer does not create HERMES_HOME on the way
+    past: a marker is only meaningful to a gateway already running out of that
+    directory, so a missing one means we are aimed at the wrong home and the
+    write fails (returning False) instead of leaving a marker somewhere
+    nobody will read.
     """
     try:
-        target_start_time = _get_process_start_time(target_pid)
-        record = {
-            "target_pid": target_pid,
-            "target_start_time": target_start_time,
-            "stopper_pid": os.getpid(),
-            "written_at": _utc_now_iso(),
-        }
-        _write_json_file(_get_planned_stop_marker_path(), record)
+        record = build_planned_stop_record(
+            target_pid,
+            _get_process_start_time(target_pid),
+            os.getpid(),
+        )
+        write_marker_atomic(_get_planned_stop_marker_path(), record)
         return True
     except (OSError, PermissionError):
         return False
@@ -2129,22 +2130,18 @@ def planned_stop_marker_targets_self() -> bool:
             pass
         return False
 
+    # Same identity rule as the authoritative consume — PID always,
+    # start-time only when both sides have one — so the probe and the
+    # consume can never disagree about who a marker names (#33778, #34597).
     our_pid = os.getpid()
     if target_pid != our_pid:
         return False
-
-    # Start-time is a PID-reuse guard. It is only meaningful when both
-    # sides actually have it: ``_get_process_start_time`` returns None on
-    # platforms without ``/proc`` (macOS, native Windows — the very
-    # platform this watcher exists for). Requiring a non-None match there
-    # would make the watcher never fire and re-break the #33778 Windows
-    # session-resume path. So: when both start_times are known they must
-    # match; when either is unknown, fall back to PID equality alone
-    # (the marker is short-lived under a 60s TTL, bounding reuse risk).
-    our_start_time = _get_process_start_time(our_pid)
-    if target_start_time is not None and our_start_time is not None:
-        return target_start_time == our_start_time
-    return True
+    return pid_marker_matches(
+        target_pid,
+        target_start_time,
+        our_pid,
+        _get_process_start_time(our_pid),
+    )
 
 
 def clear_planned_stop_marker() -> None:
