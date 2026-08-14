@@ -561,7 +561,7 @@ def run_planned_stop(host: dict[str, Any]) -> tuple[int, dict[str, Any]]:
 
     # 6. The reported main process must actually exist right now.
     try:
-        os.kill(main_pid, 0)
+        os.kill(main_pid, 0)  # windows-footgun: ok — standalone path is Linux-gated above
     except ProcessLookupError:
         return fail("process", f"MainPID {main_pid} is not running")
     except PermissionError:
