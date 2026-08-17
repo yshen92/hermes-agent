@@ -26330,10 +26330,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # managers can revive the process. Planned stop paths write a marker
     # before signalling us so they can exit cleanly instead.
     _signal_initiated_shutdown = False
+    _planned_shutdown = False
 
     # Set up signal handlers
     def shutdown_signal_handler(received_signal=None):
-        nonlocal _signal_initiated_shutdown
+        nonlocal _planned_shutdown, _signal_initiated_shutdown
         # Planned --replace takeover check: when a sibling gateway is
         # taking over via --replace, it wrote a marker naming this PID
         # before sending SIGTERM. If present, treat the signal as a
@@ -26379,14 +26380,25 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _shutdown_ctx = None
             logger.debug("snapshot_shutdown_context failed: %s", _e)
 
-        if planned_takeover:
+        if (planned_takeover or planned_stop) and not _signal_initiated_shutdown:
+            # Planned intent is authoritative for this shutdown. The watcher
+            # may consume the marker before the service manager's SIGTERM
+            # arrives, so later duplicate notifications must not downgrade it.
+            _planned_shutdown = True
+
+        if planned_takeover and _planned_shutdown:
             logger.info(
                 "Received %s as a planned --replace takeover — exiting cleanly",
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM",
             )
-        elif planned_stop:
+        elif planned_stop and _planned_shutdown:
             logger.info(
                 "Received %s as a planned gateway stop — exiting cleanly",
+                _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
+            )
+        elif _planned_shutdown:
+            logger.info(
+                "Received %s during planned shutdown — preserving clean exit",
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
             )
         else:
