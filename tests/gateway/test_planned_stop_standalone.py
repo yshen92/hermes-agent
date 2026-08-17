@@ -174,13 +174,17 @@ class TestStandaloneExecution:
         assert set(payload) == {
             "target_pid",
             "target_start_time",
-            "stopper_pid",
+            "target_hermes_home",
+            "replacer_pid",
+            "replacer_hermes_home",
             "written_at",
         }
         assert payload["target_pid"] == pid
         assert payload["target_start_time"] == start_time
         # The stopper is the child interpreter, not this test process.
-        assert payload["stopper_pid"] != os.getpid()
+        assert payload["target_hermes_home"] == str(sandbox.hermes_home)
+        assert payload["replacer_pid"] != os.getpid()
+        assert payload["replacer_hermes_home"] == str(sandbox.hermes_home)
 
         invocations = sandbox.systemctl_argv()
         assert len(invocations) == 2

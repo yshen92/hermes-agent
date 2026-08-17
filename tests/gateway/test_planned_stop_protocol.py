@@ -1,6 +1,6 @@
 """Tests for the shared planned-stop marker protocol.
 
-Two things are under test here:
+Three things are under test here:
 
 1. **Wire compatibility.** ``gateway/planned_stop_protocol.py`` now owns the
    marker format that ``gateway/status.py`` used to define inline. A marker
@@ -13,10 +13,18 @@ Two things are under test here:
    through fixture hosts. Nothing in this file touches the real ``~/.hermes``,
    a real systemd, a real ``systemctl``, or any process this test did not
    spawn itself.
+3. **The exact R0 shutdown lifecycle.** The historical ``gateway/run.py``
+   handler and final exit decision are extracted from the immutable git blob
+   and executed against the standalone helper's intent marker.
 """
 
+import ast
+import asyncio
+import copy
 import json
+import logging
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -36,8 +44,10 @@ PROTOCOL_PATH = REPO_ROOT / "gateway" / "planned_stop_protocol.py"
 # gateway/status.py as of R0 (01edcadbd194f81bd7eceb9ca267737830ce24c0) — the
 # deployed revision whose markers the new writer must remain compatible with.
 R0_STATUS_BLOB = "ce02648a958f9a281303dd825ad45b2fdc8eb046"
+R0_RUN_BLOB = "24d501b5b752fe37d201843990847d1bbd306a8d"
 
 MARKER_NAME = ".gateway-planned-stop.json"
+STANDALONE_MARKER_NAME = ".gateway-takeover.json"
 FAKE_UID = 4242
 
 
@@ -73,6 +83,89 @@ def _r0_status_source():
     if proc.returncode != 0:
         return None
     return proc.stdout.decode("utf-8")
+
+
+def _r0_run_source():
+    """Return the exact R0 ``gateway/run.py`` source, or None."""
+    proc = subprocess.run(
+        ["git", "cat-file", "blob", R0_RUN_BLOB],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.decode("utf-8")
+
+
+def _build_r0_shutdown_harness(runner):
+    """Execute R0's exact nested handler and final unexpected-exit decision."""
+    source = _r0_run_source()
+    if source is None:
+        pytest.skip(
+            f"R0 gateway/run.py blob {R0_RUN_BLOB} is not present in this "
+            "repository, so the deployed shutdown lifecycle cannot be proven"
+        )
+    tree = ast.parse(source)
+    start = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "start_gateway"
+    )
+    handler = next(
+        node
+        for node in start.body
+        if isinstance(node, ast.FunctionDef) and node.name == "shutdown_signal_handler"
+    )
+    final_if = next(
+        node
+        for node in reversed(start.body)
+        if isinstance(node, ast.If)
+        and "_signal_initiated_shutdown" in ast.unparse(node.test)
+    )
+    wrapper = ast.FunctionDef(
+        name="_build",
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg="runner")],
+            kwonlyargs=[],
+            kw_defaults=[],
+            defaults=[],
+        ),
+        body=[
+            ast.Assign(
+                targets=[ast.Name(id="_signal_initiated_shutdown", ctx=ast.Store())],
+                value=ast.Constant(value=False),
+            ),
+            copy.deepcopy(handler),
+            ast.FunctionDef(
+                name="final_exit_is_clean",
+                args=ast.arguments(
+                    posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]
+                ),
+                body=[copy.deepcopy(final_if), ast.Return(value=ast.Constant(value=True))],
+                decorator_list=[],
+            ),
+            ast.Return(
+                value=ast.Tuple(
+                    elts=[
+                        ast.Name(id="shutdown_signal_handler", ctx=ast.Load()),
+                        ast.Name(id="final_exit_is_clean", ctx=ast.Load()),
+                    ],
+                    ctx=ast.Load(),
+                )
+            ),
+        ],
+        decorator_list=[],
+    )
+    module = ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[]))
+    namespace = {
+        "asyncio": asyncio,
+        "logger": logging.getLogger("r0-shutdown-test"),
+        "signal": signal,
+        "_hermes_home": Path("/nonexistent-r0-test-home"),
+    }
+    exec(compile(module, f"<git blob {R0_RUN_BLOB} shutdown harness>", "exec"), namespace)
+    return namespace["_build"](runner)
 
 
 def _load_r0_status(hermes_home: Path) -> SimpleNamespace:
@@ -248,7 +341,7 @@ class Sandbox:
         )
         self.systemctl.chmod(0o755)
 
-        self.marker_path = self.hermes_home / MARKER_NAME
+        self.marker_path = self.hermes_home / STANDALONE_MARKER_NAME
         self._children: list[subprocess.Popen] = []
 
     # -- live processes -------------------------------------------------
@@ -496,6 +589,29 @@ class TestR0MarkerCompatibility:
         assert r0.consume_planned_stop_marker_for_self() is True
         assert not marker.exists()
 
+    def test_r0_consumes_standalone_stop_intent_without_watcher_visibility(
+        self, tmp_path, monkeypatch
+    ):
+        """Step E must use an R0 intent path its planned watcher cannot race."""
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        r0 = _load_r0_status(home)
+
+        record = protocol.build_takeover_record(
+            os.getpid(),
+            r0._get_process_start_time(os.getpid()),
+            str(home),
+            os.getpid(),
+            str(home),
+        )
+        marker = home / protocol.TAKEOVER_MARKER_FILENAME
+        protocol.write_marker_atomic(marker, record)
+
+        assert r0.planned_stop_marker_targets_self() is False
+        assert r0.consume_takeover_marker_for_self() is True
+        assert not marker.exists()
+
     def test_marker_bytes_match_what_r0_would_have_written(self, tmp_path, monkeypatch):
         """The write path changed (no ``utils.atomic_json_write``); the bytes
         it lays down must not have."""
@@ -589,6 +705,124 @@ class TestR0MarkerCompatibility:
         assert protocol.linux_process_start_time(pid) == r0._get_process_start_time(pid)
 
 
+class TestExactR0ShutdownRuntime:
+    """Qualify Step E against R0's immutable handler and final exit decision."""
+
+    @staticmethod
+    def _runner():
+        stopped = asyncio.Event()
+
+        async def stop():
+            stopped.set()
+
+        return SimpleNamespace(
+            _signal_initiated_shutdown=False,
+            _restart_requested=False,
+            stop=stop,
+            stopped=stopped,
+        )
+
+    @staticmethod
+    def _install_r0_modules(monkeypatch, r0):
+        status_stub = ModuleType("gateway.status")
+        status_stub.consume_takeover_marker_for_self = r0.consume_takeover_marker_for_self
+        status_stub.consume_planned_stop_marker_for_self = (
+            r0.consume_planned_stop_marker_for_self
+        )
+        forensics_stub = ModuleType("gateway.shutdown_forensics")
+        forensics_stub.snapshot_shutdown_context = lambda received_signal: None
+        forensics_stub.format_context_for_log = lambda context: ""
+        forensics_stub.spawn_async_diagnostic = lambda *args, **kwargs: None
+        monkeypatch.setitem(sys.modules, "gateway.status", status_stub)
+        monkeypatch.setitem(sys.modules, "gateway.shutdown_forensics", forensics_stub)
+
+    @pytest.mark.asyncio
+    async def test_old_planned_marker_reproduces_watcher_then_sigterm_failure(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        r0 = _load_r0_status(home)
+        start_time = 987654
+        r0.consume_planned_stop_marker_for_self.__globals__["_get_process_start_time"] = (
+            lambda pid: start_time
+        )
+        self._install_r0_modules(monkeypatch, r0)
+
+        record = protocol.build_planned_stop_record(
+            os.getpid(), start_time, os.getpid()
+        )
+        protocol.write_marker_atomic(home / MARKER_NAME, record)
+        runner = self._runner()
+        handler, final_exit_is_clean = _build_r0_shutdown_harness(runner)
+
+        handler(None)
+        handler(signal.SIGTERM)
+        await asyncio.wait_for(runner.stopped.wait(), timeout=1)
+
+        assert runner._signal_initiated_shutdown is True
+        assert final_exit_is_clean() is False
+
+    @pytest.mark.asyncio
+    async def test_standalone_intent_stops_exact_r0_with_clean_manager_result(
+        self, module, sandbox, monkeypatch
+    ):
+        home = sandbox.hermes_home
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        r0 = _load_r0_status(home)
+        start_time = 987654
+        r0.consume_takeover_marker_for_self.__globals__["_get_process_start_time"] = (
+            lambda pid: start_time
+        )
+        self._install_r0_modules(monkeypatch, r0)
+        sandbox.write_stat(os.getpid(), start_time=start_time)
+        sandbox.set_show(main_pid=os.getpid())
+        runner = self._runner()
+        handler, final_exit_is_clean = _build_r0_shutdown_harness(runner)
+
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            verb = argv[2]
+            if verb == "show":
+                stdout = (sandbox.control_dir / "show-user.txt").read_bytes()
+                return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=b"")
+            assert verb == "stop"
+            assert sandbox.marker_path.exists()
+            assert not (home / MARKER_NAME).exists()
+            handler(signal.SIGTERM)
+            return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+
+        monkeypatch.setattr(
+            module,
+            "subprocess",
+            SimpleNamespace(run=fake_run, TimeoutExpired=subprocess.TimeoutExpired),
+        )
+        exit_code, result = run_stop(module, sandbox)
+        await asyncio.wait_for(runner.stopped.wait(), timeout=1)
+
+        assert exit_code == 0, result
+        assert [argv[2] for argv in calls] == ["show", "stop"]
+        assert not sandbox.marker_path.exists()
+        assert runner._signal_initiated_shutdown is False
+        clean_exit = final_exit_is_clean()
+        assert clean_exit is True
+        manager_result = {
+            "ActiveState": "inactive" if runner.stopped.is_set() else "active",
+            "Result": "success" if clean_exit else "exit-code",
+            "ExecMainCode": 1 if runner.stopped.is_set() else 0,  # CLD_EXITED
+            "ExecMainStatus": 0 if clean_exit else 1,
+        }
+        assert manager_result == {
+            "ActiveState": "inactive",
+            "Result": "success",
+            "ExecMainCode": 1,
+            "ExecMainStatus": 0,
+        }
+
+
 # ── B. the current consumer accepts the same markers ──────────────────
 
 
@@ -643,7 +877,7 @@ class TestCurrentTargetCompatibility:
 
 class TestMarkerContent:
     @runs_fake_stop
-    def test_record_has_exactly_the_protocol_fields(self, sandbox, module):
+    def test_record_has_exactly_the_r0_takeover_fields(self, sandbox, module):
         pid = sandbox.spawn_child()
         start_time = sandbox.write_stat(pid)
         sandbox.set_show(main_pid=pid)
@@ -651,20 +885,24 @@ class TestMarkerContent:
         exit_code, result = run_stop(module, sandbox)
 
         assert exit_code == 0, result
-        assert sandbox.marker_path == sandbox.hermes_home / MARKER_NAME
+        assert sandbox.marker_path == sandbox.hermes_home / STANDALONE_MARKER_NAME
         assert result["marker_path"] == str(sandbox.marker_path)
 
         payload = json.loads(sandbox.marker_path.read_text(encoding="utf-8"))
         assert set(payload) == {
             "target_pid",
             "target_start_time",
-            "stopper_pid",
+            "target_hermes_home",
+            "replacer_pid",
+            "replacer_hermes_home",
             "written_at",
         }
         assert payload["target_pid"] == pid
         assert payload["target_start_time"] == start_time
         assert isinstance(payload["target_start_time"], int)
-        assert payload["stopper_pid"] == os.getpid()
+        assert payload["target_hermes_home"] == str(sandbox.hermes_home)
+        assert payload["replacer_pid"] == os.getpid()
+        assert payload["replacer_hermes_home"] == str(sandbox.hermes_home)
         assert isinstance(payload["written_at"], str)
 
         written_at = datetime.fromisoformat(payload["written_at"])

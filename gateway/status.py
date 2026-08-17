@@ -31,7 +31,10 @@ from utils import atomic_json_write
 from gateway.planned_stop_protocol import (
     PLANNED_STOP_MARKER_FILENAME as _PLANNED_STOP_MARKER_FILENAME,
     PLANNED_STOP_MARKER_TTL_S as _PLANNED_STOP_MARKER_TTL_S,
+    TAKEOVER_MARKER_FILENAME as _TAKEOVER_MARKER_FILENAME,
+    TAKEOVER_MARKER_TTL_S as _TAKEOVER_MARKER_TTL_S,
     build_planned_stop_record,
+    build_takeover_record,
     linux_process_start_time,
     marker_is_stale as _marker_is_stale,
     pid_marker_matches,
@@ -1585,12 +1588,9 @@ def release_all_scoped_locks(
 # marker left by a crashed replacer can grief at most one future
 # shutdown on the same PID — and only within _TAKEOVER_MARKER_TTL_S.
 
-_TAKEOVER_MARKER_FILENAME = ".gateway-takeover.json"
-_TAKEOVER_MARKER_TTL_S = 60  # Marker older than this is treated as stale
-# _PLANNED_STOP_MARKER_FILENAME / _PLANNED_STOP_MARKER_TTL_S are imported at
-# the top of this module from gateway.planned_stop_protocol, which owns the
-# planned-stop wire format so an out-of-tree stopper and this process cannot
-# drift apart.
+# Marker filenames, TTLs, and record builders are imported from
+# gateway.planned_stop_protocol so the in-tree writers and standalone stopper
+# cannot drift apart.
 
 
 def _get_takeover_marker_path(hermes_home: Optional[Path] = None) -> Path:
@@ -1706,16 +1706,13 @@ def write_takeover_marker(
         )
         if target_start_time is _UNSET:
             target_start_time = _get_process_start_time(target_pid)
-        record = {
-            "target_pid": target_pid,
-            "target_start_time": target_start_time,
-            "target_hermes_home": str(marker_home),
-            "replacer_pid": os.getpid(),
-            "replacer_hermes_home": str(
-                _canonical_hermes_home(_get_process_hermes_home())
-            ),
-            "written_at": _utc_now_iso(),
-        }
+        record = build_takeover_record(
+            target_pid,
+            target_start_time,
+            str(marker_home),
+            os.getpid(),
+            str(_canonical_hermes_home(_get_process_hermes_home())),
+        )
         _write_json_file(_get_takeover_marker_path(marker_home), record)
         return True
     except (OSError, PermissionError):

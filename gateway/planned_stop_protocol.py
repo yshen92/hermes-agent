@@ -15,7 +15,10 @@ This module is the single definition of it.  Three callers share these bytes:
    profile home before pausing that profile's gateway for an update.
 3. A deployment executor that has no Hermes checkout to import from streams
    this exact file to a fresh interpreter on stdin and lets ``main()`` stop
-   the production gateway.
+   the production gateway.  That standalone path targets an immutable R0
+   gateway whose planned-stop watcher races its SIGTERM handler, so it uses
+   R0's existing watcher-invisible takeover marker for the same clean-exit
+   classification.  The ordinary planned-stop wire format remains unchanged.
 
 That third caller is why the module is **stdlib-only, unconditionally**, has
 no import-time side effects, and never touches ``__file__``, the cwd, or a
@@ -74,6 +77,8 @@ except ImportError:  # pragma: no cover - Windows
 
 PLANNED_STOP_MARKER_FILENAME = ".gateway-planned-stop.json"
 PLANNED_STOP_MARKER_TTL_S = 60
+TAKEOVER_MARKER_FILENAME = ".gateway-takeover.json"
+TAKEOVER_MARKER_TTL_S = 60
 
 
 def utc_now_iso() -> str:
@@ -133,6 +138,29 @@ def build_planned_stop_record(
         "target_pid": target_pid,
         "target_start_time": target_start_time,
         "stopper_pid": stopper_pid,
+        "written_at": utc_now_iso(),
+    }
+
+
+def build_takeover_record(
+    target_pid: int,
+    target_start_time: Any,
+    target_hermes_home: str,
+    replacer_pid: int,
+    replacer_hermes_home: str,
+) -> dict[str, Any]:
+    """Build the existing R0 takeover record used by both stop paths.
+
+    R0's planned-stop watcher never observes this marker, while its SIGTERM
+    handler consumes it before checking the ordinary planned-stop marker. This
+    avoids the watcher-first race without changing the immutable R0 process.
+    """
+    return {
+        "target_pid": target_pid,
+        "target_start_time": target_start_time,
+        "target_hermes_home": target_hermes_home,
+        "replacer_pid": replacer_pid,
+        "replacer_hermes_home": replacer_hermes_home,
         "written_at": utc_now_iso(),
     }
 
@@ -577,9 +605,16 @@ def run_planned_stop(host: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             f"no start time for MainPID {main_pid} under {proc_root}",
         )
 
-    # 8. First and only write. Everything above was read-only.
-    marker_path = Path(hermes_home) / PLANNED_STOP_MARKER_FILENAME
-    record = build_planned_stop_record(main_pid, start_time, os.getpid())
+    # 8. First and only write. Everything above was read-only. The standalone
+    #    Step-E consumer is immutable R0: its planned-stop watcher can consume
+    #    the ordinary marker before systemd's SIGTERM arrives, then the later
+    #    SIGTERM is misclassified as unexpected. R0's existing takeover marker
+    #    carries the same PID/start-time/TTL authority but is observed only by
+    #    the SIGTERM handler, so it deterministically avoids that race.
+    marker_path = Path(hermes_home) / TAKEOVER_MARKER_FILENAME
+    record = build_takeover_record(
+        main_pid, start_time, hermes_home, os.getpid(), hermes_home
+    )
     try:
         write_marker_atomic(marker_path, record)
     except OSError as exc:
