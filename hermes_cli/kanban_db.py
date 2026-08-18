@@ -6601,16 +6601,49 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+def _ensure_git_worktree(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+    *,
+    allow_existing_branch: bool = False,
+) -> None:
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    Reusing this task's existing linked worktree is fine (early return). When a
+    NEW worktree must be materialized, a Hermes-DERIVED ``branch_name`` — the
+    project-linked ``<slug>/<task-id…>`` or the ``wt/<task-id>`` fallback —
+    fails closed if that branch already exists: a stale or attacker-planted
+    branch must never silently become the history the task runs on. Callers
+    pass ``allow_existing_branch=True`` for a branch the caller chose
+    explicitly (``kanban create --branch <name>`` on a non-project task), which
+    keeps the established "check that branch out here" behaviour.
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
             return
+    branch_exists = _git_branch_exists(repo_root, branch_name)
+    if branch_exists and not allow_existing_branch:
+        # Refuse before any filesystem side effect so a rejected dispatch
+        # leaves neither .worktrees/ nor a registered worktree behind.
+        raise RuntimeError(
+            f"refusing to materialize worktree {target}: branch {branch_name!r} "
+            f"already exists in {repo_root} with no linked worktree checkout for "
+            "this task. Hermes never adopts a pre-existing branch for a derived "
+            "task branch name; delete or rename the branch (or restore the "
+            "task's original worktree), then retry."
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
-    if _git_branch_exists(repo_root, branch_name):
+    # A branch racing IN between the check and here is caught by the returncode
+    # check below: ``-b`` collides and git fails loudly instead of quietly
+    # creating the wrong history. The adoption arm keeps git's pre-L9a
+    # semantics verbatim, DWIM included — a name that vanished locally can
+    # still resolve against a unique same-named remote-tracking branch — so
+    # the race-OUT direction is not a loud failure.
+    if branch_exists:
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
         cmd = [
@@ -6644,7 +6677,19 @@ def _resolve_worktree_workspace(
     launched from, e.g. the Hermes checkout). If no anchor is configured
     anywhere, we fail loudly rather than guess.
     """
-    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    stored_branch = (task.branch_name or "").strip()
+    branch_name = stored_branch or f"wt/{task.id}"
+    # Fail closed only on names Hermes derived itself: the project-linked
+    # ``<slug>/<task-id…>`` and the ``wt/<task-id>`` fallback. A branch the
+    # caller named explicitly on a non-project task is theirs to check out.
+    # The canonical fallback stays derived even once it is persisted: the
+    # dispatcher writes the resolved branch back to the row, so on a later
+    # re-dispatch a stored ``wt/<task-id>`` must not read as a caller's choice.
+    allow_existing_branch = (
+        bool(stored_branch)
+        and not task.project_id
+        and stored_branch != f"wt/{task.id}"
+    )
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
@@ -6671,7 +6716,10 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(
+            repo_root, target, branch_name,
+            allow_existing_branch=allow_existing_branch,
+        )
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -6697,7 +6745,10 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _ensure_git_worktree(
+                    fallback_root, fallback, branch_name,
+                    allow_existing_branch=allow_existing_branch,
+                )
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
         # task's own canonical worktree): keep the legacy reuse rather
@@ -6707,7 +6758,10 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(
+            repo_root, target, branch_name,
+            allow_existing_branch=allow_existing_branch,
+        )
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -6716,7 +6770,10 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    _ensure_git_worktree(
+        repo_root, requested, branch_name,
+        allow_existing_branch=allow_existing_branch,
+    )
     return requested, branch_name
 
 
@@ -6741,7 +6798,15 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
       and materializes ``<repo>/.worktrees/<task-id>`` per task; if no
       ``default_workdir`` is configured it raises rather than guessing from the
       dispatcher's CWD. When ``branch_name`` is empty, Hermes uses
-      ``wt/<task-id>``.
+      ``wt/<task-id>``. Materializing a NEW worktree requires a Hermes-DERIVED
+      task branch — the project-linked ``<slug>/<task-id…>`` or the
+      ``wt/<task-id>`` fallback, which stays derived even after the dispatcher
+      persists it back to the row — to not already exist: such a branch is
+      never adopted, including a surviving branch whose worktree vanished, so
+      resolution fails closed and the operator must delete/rename the branch
+      or restore the original worktree before the task can run. A branch the
+      caller selected explicitly on a non-project task is still materialized
+      from that existing branch, as before.
 
     Persist the resolved path back to the task row via ``set_workspace_path``
     so subsequent runs reuse the same directory.
